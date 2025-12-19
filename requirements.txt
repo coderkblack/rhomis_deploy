@@ -1,9 +1,9 @@
-streamlit==1.26.1
+streamlit
 xgboost
 lightgbm
 plotly
 python>=3.11,<3.12
 scikit-learn==1.6.1
-numpy==1.26.4
-pandas==2.1.4
+numpy
+pandas
 joblib==1.3.2
