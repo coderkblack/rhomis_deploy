@@ -47,25 +47,25 @@ st.set_page_config(
 # Model configuration
 MODEL_INFO = {
     "Random Forest": {
-        "file": "optimizedModels/random_forest_optimized.pkl",
+        "file": "deployment/optimizedModels/random_forest_optimized.pkl",
         "icon": ":blue[:material/hub:]",
         "description": "Fast and reliable ensemble method",
         "accuracy": 0.80
     },
     "XGBoost": {
-        "file": "optimizedModels/xgboost_optimized.pkl",
+        "file": "deployment/optimizedModels/xgboost_optimized.pkl",
         "icon": ":green[:material/leaf:]",
         "description": "High accuracy gradient boosting",
         "accuracy": 0.82
     },
     "LightGBM": {
-        "file": "optimizedModels/lightgbm_optimized.pkl",
+        "file": "deployment/optimizedModels/lightgbm_optimized.pkl",
         "icon": ":orange[:material/trending_up:]",
         "description": "Lightweight and fast boosting",
         "accuracy": 0.81
     },
     "Logistic Regression": {
-        "file": "optimizedModels/logistic_regression_optimized.pkl",
+        "file": "deployment/optimizedModels/logistic_regression_optimized.pkl",
         "icon": "⚙️",
         "description": "Interpretable baseline model",
         "accuracy": 0.75
@@ -163,7 +163,7 @@ def load_models():
     
     # Load preprocessor
     try:
-        preprocessor_path = Path("optimizedModels/preprocessor.pkl")
+        preprocessor_path = Path("deployment/optimizedModels/preprocessor.pkl")
         if preprocessor_path.exists():
             preprocessor = joblib.load(preprocessor_path)
             # No success message - only show errors
@@ -176,7 +176,7 @@ def load_models():
     
     # Load label encoder
     try:
-        encoder_path = Path("optimizedModels/label_encoder.pkl")
+        encoder_path = Path("deployment/optimizedModels/label_encoder.pkl")
         if encoder_path.exists():
             label_encoder = joblib.load(encoder_path)
             # No success message - only show errors
