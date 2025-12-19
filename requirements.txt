@@ -1,9 +1,9 @@
-python==3.10.*
 streamlit
-pandas
-numpy
-scikit-learn
 xgboost
 lightgbm
 plotly
-joblib
+python==3.10.*
+scikit-learn==1.2.2
+numpy==1.26.4
+pandas==2.1.4
+joblib==1.3.2
