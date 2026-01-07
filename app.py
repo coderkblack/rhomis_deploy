@@ -388,7 +388,7 @@ def make_prediction(model, preprocessed_data, label_encoder):
         else:
             decoded_label = label_encoder.inverse_transform([prediction])[0]
             # Ensure proper formatting of the label
-            if "Secure" in str(decoded_label) and "Food" not in str(decoded_label):
+            if ("Secure" in str(decoded_label) or "Insecure" in str(decoded_label)) and "Food" not in str(decoded_label):
                 pred_label = f"Food {decoded_label}"
             else:
                 pred_label = str(decoded_label)
