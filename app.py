@@ -63,7 +63,7 @@ CLASS_META = {
                      'desc': 'Severe food shortage; household experiencing hunger.'},
 }
 
-MODELS_DIR = Path("/home/jakes/Documents/strathmore/Modules/Module 3/DS1/foodSecurity/models/savedModels")
+MODELS_DIR = Path("savedModels")
 
 MODEL_INFO = {
     "Stacking Ensemble": {
