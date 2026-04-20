@@ -483,7 +483,16 @@ def prepare_catboost_input(engineered_df: pd.DataFrame, num_imputer, feature_met
 
     num_present = [c for c in num_feats if c in engineered_df.columns]
     if num_present:
-        num_arr = num_imputer.transform(engineered_df[num_present])
+        num_input = engineered_df[num_present].copy()
+        # Ordinal-encode any categorical column that ended up in the numeric
+        # imputer (it was label-encoded before the imputer was fitted in the
+        # notebook, so it expects integers, not raw strings).
+        for col, cats in CATEGORICAL_FEATURES.items():
+            if col in num_input.columns:
+                num_input[col] = num_input[col].apply(
+                    lambda v: float(cats.index(v)) if v in cats else np.nan
+                )
+        num_arr = num_imputer.transform(num_input)
         num_df  = pd.DataFrame(num_arr, columns=num_present)
     else:
         num_df = pd.DataFrame()
