@@ -13,19 +13,26 @@
 # limitations under the License.
 
 """
-Food Security Prediction Assistant - Chat-Based ML Deployment App
+Food Security Prediction Assistant - Chat-Based ML Deployment App (v3)
 
-A Streamlit application for deploying machine learning models with a conversational
-chat interface. Users can select a model and provide household information to receive
-food security predictions with confidence scores.
+Aligned with food_security_notebook_v2_improved.ipynb:
+  - 4-class ordinal target: FoodSecure, MildlyFI, ModeratelyFI, SeverelyFI
+  - Primary metric: Weighted (Quadratic) Cohen's Kappa
+  - Full ~20-feature input schema (leakage columns removed)
+  - Serving-side feature engineering mirroring notebook sections 4.3-4.6
+  - Dual preprocessing paths: sklearn ColumnTransformer vs CatBoost native
+  - Stacking Ensemble as default model
+  - SHAP local explanations (optional pane)
+  - Per-class probability display
 """
 
 import streamlit as st
 import pandas as pd
 import numpy as np
-import joblib
+import pickle
 import datetime
 import time
+import traceback
 from pathlib import Path
 from collections import namedtuple
 
@@ -36,7 +43,6 @@ from collections import namedtuple
 st.set_page_config(
     page_title="Food Security Prediction Assistant",
     page_icon="🌾",
-    # layout="",
     initial_sidebar_state="expanded"
 )
 
@@ -44,408 +50,673 @@ st.set_page_config(
 # CONSTANTS & CONFIGURATION
 # ==============================================================================
 
-# Model configuration
-MODEL_INFO = {
-    "Random Forest": {
-        "file": "optimizedModels/random_forest_optimized.pkl",
-        "icon": ":blue[:material/hub:]",
-        "description": "Fast and reliable ensemble method",
-        "accuracy": 0.80
-    },
-    "XGBoost": {
-        "file": "optimizedModels/xgboost_optimized.pkl",
-        "icon": ":green[:material/leaf:]",
-        "description": "High accuracy gradient boosting",
-        "accuracy": 0.82
-    },
-    "LightGBM": {
-        "file": "optimizedModels/lightgbm_optimized.pkl",
-        "icon": ":orange[:material/trending_up:]",
-        "description": "Lightweight and fast boosting",
-        "accuracy": 0.81
-    },
-    "Logistic Regression": {
-        "file": "optimizedModels/logistic_regression_optimized.pkl",
-        "icon": "⚙️",
-        "description": "Interpretable baseline model",
-        "accuracy": 0.75
-    }
+HFIAS_ORDER = ['FoodSecure', 'MildlyFI', 'ModeratelyFI', 'SeverelyFI']
+
+CLASS_META = {
+    'FoodSecure':   {'emoji': '✅', 'color': '#2e7d32', 'label': 'Food Secure',
+                     'desc': 'Household meets food needs throughout the year.'},
+    'MildlyFI':     {'emoji': '🟡', 'color': '#f9a825', 'label': 'Mildly Food Insecure',
+                     'desc': 'Occasional anxiety about food access; quality/quantity not yet reduced.'},
+    'ModeratelyFI': {'emoji': '🟠', 'color': '#e65100', 'label': 'Moderately Food Insecure',
+                     'desc': 'Reduced quality or quantity of food consumed regularly.'},
+    'SeverelyFI':   {'emoji': '🔴', 'color': '#b71c1c', 'label': 'Severely Food Insecure',
+                     'desc': 'Severe food shortage; household experiencing hunger.'},
 }
 
-# Feature configuration - Top 12 Core Features (based on feature importance analysis)
+MODELS_DIR = Path("/home/jakes/Documents/strathmore/Modules/Module 3/DS1/foodSecurity/models/savedModels")
+
+MODEL_INFO = {
+    "Stacking Ensemble": {
+        "file": MODELS_DIR / "stacking_ensemble.pkl",
+        "icon": "🏆",
+        "description": "Best model — LGBM + XGB + RF → LogReg meta-learner",
+        "weighted_kappa": 0.6504,
+        "roc_auc": 0.8285,
+        "requires_catboost_path": False,
+    },
+    "LightGBM": {
+        "file": MODELS_DIR / "lightgbm_tuned.pkl",
+        "icon": "🌿",
+        "description": "Best single model — fast leaf-wise boosting",
+        "weighted_kappa": 0.6461,
+        "roc_auc": 0.8251,
+        "requires_catboost_path": False,
+    },
+    "Voting Ensemble": {
+        "file": MODELS_DIR / "voting_ensemble.pkl",
+        "icon": "🗳️",
+        "description": "Soft-voting — LGBM + XGB + RF (best ROC-AUC)",
+        "weighted_kappa": 0.6449,
+        "roc_auc": 0.8294,
+        "requires_catboost_path": False,
+    },
+    "XGBoost": {
+        "file": MODELS_DIR / "xgboost_tuned.pkl",
+        "icon": "🍃",
+        "description": "Optuna-tuned gradient boosting",
+        "weighted_kappa": 0.6327,
+        "roc_auc": 0.8189,
+        "requires_catboost_path": False,
+    },
+    "Random Forest": {
+        "file": MODELS_DIR / "random_forest.pkl",
+        "icon": "🌲",
+        "description": "Balanced bagging ensemble",
+        "weighted_kappa": 0.6192,
+        "roc_auc": 0.8121,
+        "requires_catboost_path": False,
+    },
+    "CatBoost": {
+        "file": MODELS_DIR / "catboost_tuned.pkl",
+        "icon": "🐱",
+        "description": "Native categorical handling, Optuna-tuned",
+        "weighted_kappa": 0.6187,
+        "roc_auc": 0.8109,
+        "requires_catboost_path": True,
+    },
+}
+
+# ---------------------------------------------------------------------------
+# Feature schema
+# ---------------------------------------------------------------------------
+
 NUMERICAL_FEATURES = [
-    'NrofMonthsFoodInsecure',           # Food security status (RF, XGBoost, LightGBM)
-    'PPI_Likelihood',                   # Poverty assessment (RF, LightGBM)
-    'Food_Self_Sufficiency_kCal_MAE_day', # Food sufficiency (RF, LightGBM)
-    'HHsizeMAE',                        # Household size (RF, LightGBM)
-    'LivestockHoldings',                # Livestock holdings (RF, LightGBM)
-    'score_HDDS_GoodSeason',            # Dietary diversity (RF, LightGBM)
-    'farm_income_USD_PPP_pHH_Yr',       # Farm income (RF, XGBoost, LogReg)
-    'LandOwned',                        # Land resources (RF, LightGBM)
-    'TVA_USD_PPP_pmae_pday',            # Total value of activities (RF, LightGBM)
-    'Gender_FemaleControl'              # Gender considerations (LightGBM)
+    'HHsizeMAE',
+    'LandOwned',
+    'LandCultivated',
+    'LivestockHoldings',
+    'PPI_Likelihood',
+    'TVA_USD_PPP_pmae_pday',
+    'total_income_USD_PPP_pHH_Yr',
+    'offfarm_income_USD_PPP_pHH_Yr',
+    'farm_income_USD_PPP_pHH_Yr',
+    'value_crop_consumed_USD_PPP_pHH_Yr',
+    'livestock_prodsales_USD_PPP_pHH_Yr',
+    'value_livestock_production_USD_PPP_pHH_Yr',
+    'Food_Self_Sufficiency_kCal_MAE_day',
+    'score_HDDS_GoodSeason',
+    'score_HDDS_farmbasedGoodSeason',
+    'score_HDDS_purchasedGoodSeason',
+    'score_HDDS_BadSeason',
+    'score_HDDS_farmbasedBadSeason',
+    'score_HDDS_purchasedBadSeason',
+    'NrofMonthsWildFoodCons',
+    'GHGEmissions',
+    'NFertInput',
+    'Altitude',
+    'Gender_FemaleControl',
+    'Market_Orientation',
 ]
 
 CATEGORICAL_FEATURES = {
-    'Country': ['Tanzania', 'Burkina_Faso', 'Cambodia', 'DRC', 'Ethiopia',
-                'Ghana', 'India', 'Kenya', 'LaoPDR', 'Malawi', 'Mali',
-                'Nicaragua', 'Peru', 'Uganda', 'Vietnam', 'Zambia',
-                'Burundi', 'El_Salvador', 'Costa_Rica', 'Guatemala', 'Honduras'],
-    'WorstFoodSecMonth': ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug',
-                          'sep', 'oct', 'nov', 'dec', 'N/A']
+    'Country': [
+        'Tanzania', 'Burkina_Faso', 'Cambodia', 'DRC', 'Ethiopia',
+        'Ghana', 'India', 'Kenya', 'LaoPDR', 'Malawi', 'Mali',
+        'Nicaragua', 'Peru', 'Uganda', 'Vietnam', 'Zambia',
+        'Burundi', 'El_Salvador', 'Costa_Rica', 'Guatemala', 'Honduras',
+    ],
+    'HouseholdType': ['couple', 'single', 'polygamous', 'other'],
+    'Head_EducationLevel': [
+        'no_school', 'primary', 'secondary', 'postsecondary',
+        'adult_education', 'literate', 'religious_school', 'other',
+    ],
+    'Livestock_Orientation': ['subsistence', 'mixed', 'commercial', 'other'],
 }
 
-# Feature descriptions for user guidance
+OPTIONAL_FEATURES = {
+    'GHGEmissions', 'NFertInput', 'Altitude',
+    'NrofMonthsWildFoodCons',
+    'value_crop_consumed_USD_PPP_pHH_Yr',
+    'value_livestock_production_USD_PPP_pHH_Yr',
+    'livestock_prodsales_USD_PPP_pHH_Yr',
+    'offfarm_income_USD_PPP_pHH_Yr',
+    'score_HDDS_farmbasedGoodSeason',
+    'score_HDDS_purchasedGoodSeason',
+    'score_HDDS_farmbasedBadSeason',
+    'score_HDDS_purchasedBadSeason',
+    'Market_Orientation',
+    'Head_EducationLevel',
+    'HouseholdType',
+    'Livestock_Orientation',
+}
+
+FEATURE_QUESTIONS = {
+    'Country':                                   "Let's start — which country is your household located in?",
+    'HHsizeMAE':                                 "How many adult-equivalent household members are there? (1 adult=1.0, 1 child≈0.5)",
+    'LandOwned':                                 "How much land does your household own? (hectares; 1 ha ≈ 2.5 acres)",
+    'LandCultivated':                            "How much land does your household actively cultivate? (hectares)",
+    'LivestockHoldings':                         "Total livestock in Tropical Livestock Units (TLU)? (1 cattle=1.0, 1 goat=0.1, 10 chickens=0.1)",
+    'PPI_Likelihood':                            "Poverty probability index — likelihood the household is above the poverty line (0–100)",
+    'TVA_USD_PPP_pmae_pday':                     "Total value of all activities per adult-equivalent per day (USD PPP)",
+    'total_income_USD_PPP_pHH_Yr':               "Total household income per year (USD PPP)",
+    'offfarm_income_USD_PPP_pHH_Yr':             "(Optional) Off-farm income per year (USD PPP; enter 0 if none)",
+    'farm_income_USD_PPP_pHH_Yr':                "Farm income per year (USD PPP)",
+    'value_crop_consumed_USD_PPP_pHH_Yr':        "(Optional) Value of crops consumed at home per year (USD PPP)",
+    'livestock_prodsales_USD_PPP_pHH_Yr':        "(Optional) Value of livestock products sold per year (USD PPP)",
+    'value_livestock_production_USD_PPP_pHH_Yr': "(Optional) Total value of livestock production per year (USD PPP)",
+    'Food_Self_Sufficiency_kCal_MAE_day':        "Food self-sufficiency — calories produced per adult-equivalent per day (kcal)",
+    'score_HDDS_GoodSeason':                     "Dietary Diversity Score in the GOOD season (0–12 food groups)",
+    'score_HDDS_farmbasedGoodSeason':            "(Optional) Farm-based food groups in the good season (0–12)",
+    'score_HDDS_purchasedGoodSeason':            "(Optional) Purchased food groups in the good season (0–12)",
+    'score_HDDS_BadSeason':                      "Dietary Diversity Score in the BAD/lean season (0–12 food groups)",
+    'score_HDDS_farmbasedBadSeason':             "(Optional) Farm-based food groups in the lean season (0–12)",
+    'score_HDDS_purchasedBadSeason':             "(Optional) Purchased food groups in the lean season (0–12)",
+    'NrofMonthsWildFoodCons':                    "(Optional) Months per year the household consumes wild foods (0–12)",
+    'GHGEmissions':                              "(Optional) GHG emissions estimate for the farm (kg CO2-eq/year)",
+    'NFertInput':                                "(Optional) Nitrogen fertiliser input (kg/year)",
+    'Altitude':                                  "(Optional) Altitude of the household location (metres above sea level)",
+    'Gender_FemaleControl':                      "Proportion of household decisions made by women (0=none, 0.5=half, 1=all)",
+    'Market_Orientation':                        "(Optional) Share of farm output sold on markets (0–1)",
+    'HouseholdType':                             "(Optional) Household composition type",
+    'Head_EducationLevel':                       "(Optional) Education level of the household head",
+    'Livestock_Orientation':                     "(Optional) Primary livestock management orientation",
+}
+
 FEATURE_DESCRIPTIONS = {
-    'Country': 'Select the country where your household is located',
-    'NrofMonthsFoodInsecure': 'Think about the past 12 months - were there times you didn\'t have enough food?',
-    'WorstFoodSecMonth': 'Many households have a "hungry season" - when is it for you?',
-    'HHsizeMAE': '💡 Tip: Count all family members. Adjust for children (they eat less than adults)',
-    'LandOwned': '💡 Tip: Include all land your family owns/controls. 1 hectare is about the size of a small farm plot',
-    'LivestockHoldings': '💡 Tip: List what you own. Cattle count more than goats, which count more than chickens',
-    'Food_Self_Sufficiency_kCal_MAE_day': '💡 Tip: Consider meals your household produces + buys. A typical day: 3 meals = 1500-2000 calories',
-    'score_HDDS_GoodSeason': 'Food groups: grains, legumes, vegetables, fruits, meat, fish, eggs, dairy, oils, sweets, spices, etc.',
-    'farm_income_USD_PPP_pHH_Yr': '💡 Tip: Total earnings from crops + livestock sales over the whole year. Rough estimates are fine!',
-    'TVA_USD_PPP_pmae_pday': '💡 Tip: Typical daily income from farming or other work. If unsure, estimate based on your usual earnings',
-    'PPI_Likelihood': '💡 Tip: Based on your land, assets, income, and education - could you improve your situation?',
-    'Gender_FemaleControl': '💡 Tip: Who decides what to grow, how to spend money, children\'s education, etc.?'
+    'HHsizeMAE':                        '💡 Count all family members, adjusting for age: adults=1.0, children=0.5',
+    'LandOwned':                        '💡 Include all land owned or controlled by the household',
+    'LandCultivated':                   '💡 Only land actively farmed this season',
+    'LivestockHoldings':                '💡 TLU equivalents: 1 cattle=1.0, 1 sheep/goat=0.1, 10 chickens≈0.1',
+    'PPI_Likelihood':                   '💡 Higher = more likely above poverty line. Use your best estimate (0–100)',
+    'score_HDDS_GoodSeason':            '💡 Count distinct food groups: grains, legumes, vegetables, fruits, meat, fish, eggs, dairy, oils, sweets, condiments',
+    'score_HDDS_BadSeason':             '💡 Same food groups but during the lean/dry season — the most predictive single feature in the model',
+    'Food_Self_Sufficiency_kCal_MAE_day': '💡 Subsistence ≈ 500–1500 kcal/MAE/day; moderate ≈ 1500–2500; surplus > 2500',
+    'farm_income_USD_PPP_pHH_Yr':       '💡 Rough ranges: low < $300, medium $300–$1500, high > $1500 USD PPP/year',
+    'total_income_USD_PPP_pHH_Yr':      '💡 Include all sources: crops, livestock, off-farm wages, remittances',
+    'TVA_USD_PPP_pmae_pday':            '💡 Approximate: total annual income ÷ 365 ÷ household MAE size',
+    'Gender_FemaleControl':             '💡 0 = all decisions by men, 0.5 = equal, 1 = all decisions by women',
 }
 
-# Feature grouping for conversational flow
 FEATURE_BLOCKS = {
-    "Location": ['Country'],
-    "Household Information": ['HHsizeMAE'],
-    "Land Resources": ['LandOwned'],
-    "Livestock": ['LivestockHoldings'],
-    "Food Security Status": ['NrofMonthsFoodInsecure', 'WorstFoodSecMonth'],
-    "Nutritional Status": ['Food_Self_Sufficiency_kCal_MAE_day', 'score_HDDS_GoodSeason'],
-    "Income & Livelihoods": ['farm_income_USD_PPP_pHH_Yr', 'TVA_USD_PPP_pmae_pday'],
-    "Poverty & Gender": ['PPI_Likelihood', 'Gender_FemaleControl']
+    "📍 Location":                ['Country'],
+    "👨‍👩‍👧 Household":            ['HHsizeMAE', 'HouseholdType', 'Head_EducationLevel', 'Gender_FemaleControl'],
+    "🌾 Land & Livestock":        ['LandOwned', 'LandCultivated', 'LivestockHoldings', 'Livestock_Orientation'],
+    "🥗 Nutrition (Good Season)": ['score_HDDS_GoodSeason', 'score_HDDS_farmbasedGoodSeason',
+                                   'score_HDDS_purchasedGoodSeason', 'Food_Self_Sufficiency_kCal_MAE_day'],
+    "🥗 Nutrition (Lean Season)": ['score_HDDS_BadSeason', 'score_HDDS_farmbasedBadSeason',
+                                   'score_HDDS_purchasedBadSeason', 'NrofMonthsWildFoodCons'],
+    "💰 Income & Livelihoods":    ['total_income_USD_PPP_pHH_Yr', 'farm_income_USD_PPP_pHH_Yr',
+                                   'offfarm_income_USD_PPP_pHH_Yr', 'TVA_USD_PPP_pmae_pday',
+                                   'value_crop_consumed_USD_PPP_pHH_Yr',
+                                   'livestock_prodsales_USD_PPP_pHH_Yr',
+                                   'value_livestock_production_USD_PPP_pHH_Yr',
+                                   'Market_Orientation'],
+    "📊 Assets & Poverty":        ['PPI_Likelihood'],
+    "🌍 Environment":             ['GHGEmissions', 'NFertInput', 'Altitude'],
 }
 
-# Rate limiting
 MIN_TIME_BETWEEN_REQUESTS = datetime.timedelta(seconds=1)
-
-# Debug mode
-DEBUG_MODE = st.query_params.get("debug", "false").lower() == "true"
-
-# Named tuple for task management
 TaskInfo = namedtuple("TaskInfo", ["name", "value"])
 
+EDU_MAP = {
+    'no_school': 'no_school', 'no school': 'no_school',
+    'illiterate': 'no_school', 'none': 'no_school',
+    'adult_education': 'adult_education',
+    'adult education, literacy school or parish school': 'adult_education',
+    'postsecondary': 'postsecondary', 'post-secondary': 'postsecondary',
+    'primary': 'primary', 'secondary': 'secondary',
+    'literate': 'literate', 'religious_school': 'religious_school',
+}
+HT_MAP = {
+    'couple': 'couple', 'together': 'couple',
+    'couple_man_works_away': 'couple', 'couple_woman_works_away': 'couple',
+    'woman_single': 'single', 'man_single': 'single', 'single': 'single',
+    'polygamous': 'polygamous',
+}
+LOG_COLS = [
+    'LandOwned', 'LandCultivated', 'LivestockHoldings',
+    'TVA_USD_PPP_pmae_pday', 'total_income_USD_PPP_pHH_Yr',
+    'offfarm_income_USD_PPP_pHH_Yr', 'farm_income_USD_PPP_pHH_Yr',
+    'value_crop_consumed_USD_PPP_pHH_Yr',
+    'value_livestock_production_USD_PPP_pHH_Yr',
+    'livestock_prodsales_USD_PPP_pHH_Yr',
+    'Food_Self_Sufficiency_kCal_MAE_day',
+    'GHGEmissions', 'NFertInput', 'Altitude',
+]
+EPS = 1e-6
+
+
 # ==============================================================================
-# MODEL LOADING (PLACEHOLDER - REPLACE WITH ACTUAL MODELS)
+# ARTIFACT LOADING
 # ==============================================================================
 
 @st.cache_resource(ttl=3600)
-def load_models():
-    """
-    Load all ML models, preprocessor, and label encoder.
-    Models are loaded from the optimizedModels folder.
-    Only display messages if there are errors or warnings.
-    """
+def load_artifacts():
     models = {}
-    
     for model_name, info in MODEL_INFO.items():
-        try:
-            model_path = Path(info["file"])
-            
-            if model_path.exists():
-                model = joblib.load(model_path)
-                models[model_name] = model
-                # No success message - only show errors
-            else:
-                st.warning(f"⚠️ Model file not found: {info['file']}")
+        path = Path(info["file"])
+        if path.exists():
+            try:
+                with open(path, 'rb') as f:
+                    models[model_name] = pickle.load(f)
+            except Exception as e:
+                st.warning(f"⚠️ Could not load {model_name}: {e}")
                 models[model_name] = None
-                
-        except Exception as e:
-            st.error(f"❌ Error loading {model_name}: {str(e)}")
+        else:
             models[model_name] = None
-    
-    # Load preprocessor
-    try:
-        preprocessor_path = Path("optimizedModels/preprocessor.pkl")
-        if preprocessor_path.exists():
-            preprocessor = joblib.load(preprocessor_path)
-            # No success message - only show errors
-        else:
-            st.warning("⚠️ Preprocessor file not found")
-            preprocessor = None
-    except Exception as e:
-        st.error(f"❌ Error loading preprocessor: {str(e)}")
-        preprocessor = None
-    
-    # Load label encoder
-    try:
-        encoder_path = Path("optimizedModels/label_encoder.pkl")
-        if encoder_path.exists():
-            label_encoder = joblib.load(encoder_path)
-            # No success message - only show errors
-        else:
-            st.warning("⚠️ Label encoder file not found")
-            label_encoder = None
-    except Exception as e:
-        st.error(f"❌ Error loading label encoder: {str(e)}")
-        label_encoder = None
-    
-    return models, preprocessor, label_encoder
 
+    def _load(rel_path, label):
+        p = MODELS_DIR / rel_path
+        if p.exists():
+            try:
+                with open(p, 'rb') as f:
+                    return pickle.load(f)
+            except Exception as e:
+                st.warning(f"⚠️ Could not load {label}: {e}")
+        else:
+            st.warning(f"⚠️ {label} not found at {p}")
+        return None
 
-@st.cache_resource
-def get_model_list():
-    """Get list of available models."""
-    return list(MODEL_INFO.keys())
+    preprocessor  = _load("preprocessor.pkl",    "Preprocessor")
+    num_imputer   = _load("num_imputer.pkl",      "Numeric imputer (CatBoost path)")
+    label_encoder = _load("label_encoder.pkl",    "Label encoder")
+    feature_meta  = _load("feature_metadata.pkl", "Feature metadata")
+
+    return models, preprocessor, num_imputer, label_encoder, feature_meta
 
 
 # ==============================================================================
-# HELPER FUNCTIONS
+# SERVING-SIDE FEATURE ENGINEERING  (mirrors notebook sections 4.3-4.6)
+# ==============================================================================
+
+def engineer_features(raw_df: pd.DataFrame) -> pd.DataFrame:
+    df = raw_df.copy()
+
+    # Section 4.3 — Standardise categoricals
+    if 'Head_EducationLevel' in df.columns:
+        df['Head_EducationLevel'] = (
+            df['Head_EducationLevel'].astype(str).str.lower().str.strip()
+            .map(EDU_MAP).fillna('other')
+        )
+    if 'HouseholdType' in df.columns:
+        df['HouseholdType'] = (
+            df['HouseholdType'].astype(str).str.lower().str.strip()
+            .map(HT_MAP).fillna('other')
+        )
+
+    # Section 4.4 — log1p transforms & missingness flags
+    for col in LOG_COLS:
+        if col in df.columns:
+            df[col] = np.log1p(pd.to_numeric(df[col], errors='coerce').clip(lower=0))
+
+    df['ghg_observed']   = (~df['GHGEmissions'].isna()).astype(int) if 'GHGEmissions' in df.columns else 0
+    df['nfert_observed'] = (~df['NFertInput'].isna()).astype(int)   if 'NFertInput'   in df.columns else 0
+
+    # Section 4.5 — Domain-specific features
+    hhsize = df.get('HHsizeMAE', pd.Series([1.0])).fillna(1.0)
+    if 'total_income_USD_PPP_pHH_Yr' in df.columns:
+        df['income_per_MAE'] = df['total_income_USD_PPP_pHH_Yr'] / (hhsize + EPS)
+    if 'LandCultivated' in df.columns:
+        df['land_per_MAE'] = df['LandCultivated'] / (hhsize + EPS)
+    if 'LivestockHoldings' in df.columns:
+        df['livestock_per_MAE'] = df['LivestockHoldings'] / (hhsize + EPS)
+
+    if all(c in df.columns for c in ['offfarm_income_USD_PPP_pHH_Yr', 'total_income_USD_PPP_pHH_Yr']):
+        offfarm_raw = np.expm1(pd.to_numeric(df['offfarm_income_USD_PPP_pHH_Yr'], errors='coerce').clip(lower=0))
+        total_raw   = np.expm1(pd.to_numeric(df['total_income_USD_PPP_pHH_Yr'],   errors='coerce').clip(lower=EPS))
+        df['income_diversification'] = (offfarm_raw / total_raw).clip(0, 1)
+
+    if all(c in df.columns for c in ['score_HDDS_GoodSeason', 'score_HDDS_BadSeason']):
+        df['hdds_seasonal_gap']     = df['score_HDDS_GoodSeason'] - df['score_HDDS_BadSeason']
+        df['hdds_bad_season_share'] = df['score_HDDS_BadSeason'] / (df['score_HDDS_GoodSeason'] + EPS)
+    if all(c in df.columns for c in ['score_HDDS_farmbasedGoodSeason', 'score_HDDS_GoodSeason']):
+        df['hdds_farm_reliance']    = df['score_HDDS_farmbasedGoodSeason'] / (df['score_HDDS_GoodSeason'] + EPS)
+    if all(c in df.columns for c in ['score_HDDS_purchasedGoodSeason', 'score_HDDS_GoodSeason']):
+        df['hdds_purchase_reliance'] = df['score_HDDS_purchasedGoodSeason'] / (df['score_HDDS_GoodSeason'] + EPS)
+
+    # Section 4.6 — Interactions, indices, efficiency ratios
+    if 'income_per_MAE' in df.columns:
+        df['income_per_MAE_sq'] = df['income_per_MAE'] ** 2
+    if all(c in df.columns for c in ['LandCultivated', 'LivestockHoldings']):
+        df['land_livestock_product'] = df['LandCultivated'] * df['LivestockHoldings']
+    if all(c in df.columns for c in ['Market_Orientation', 'farm_income_USD_PPP_pHH_Yr']):
+        df['market_income_interaction'] = (
+            pd.to_numeric(df['Market_Orientation'], errors='coerce').fillna(0) *
+            df['farm_income_USD_PPP_pHH_Yr']
+        )
+    if all(c in df.columns for c in ['score_HDDS_GoodSeason', 'Food_Self_Sufficiency_kCal_MAE_day']):
+        df['diet_quality_quantity'] = df['score_HDDS_GoodSeason'] * df['Food_Self_Sufficiency_kCal_MAE_day']
+    if all(c in df.columns for c in ['NrofMonthsWildFoodCons', 'score_HDDS_BadSeason']):
+        df['wild_food_coping'] = (
+            pd.to_numeric(df['NrofMonthsWildFoodCons'], errors='coerce').fillna(0) *
+            (1 / (df['score_HDDS_BadSeason'] + 1))
+        )
+    if all(c in df.columns for c in ['PPI_Likelihood', 'total_income_USD_PPP_pHH_Yr']):
+        df['poverty_income_ratio'] = df['PPI_Likelihood'] / (df['total_income_USD_PPP_pHH_Yr'] + EPS)
+
+    # Aggregated indices
+    liv_cols = [c for c in ['LandCultivated', 'LivestockHoldings', 'total_income_USD_PPP_pHH_Yr']
+                if c in df.columns]
+    if len(liv_cols) >= 2:
+        tmp = df[liv_cols].copy().apply(pd.to_numeric, errors='coerce')
+        for c in liv_cols:
+            r = tmp[c].max() - tmp[c].min()
+            tmp[c] = (tmp[c] - tmp[c].min()) / r if r > 0 else 0
+        df['livelihood_index'] = tmp.mean(axis=1)
+
+    if all(c in df.columns for c in ['score_HDDS_GoodSeason', 'score_HDDS_BadSeason']):
+        df['nutrition_index'] = (df['score_HDDS_GoodSeason'] + df['score_HDDS_BadSeason']) / 2
+
+    env_cols = [c for c in ['GHGEmissions', 'NFertInput'] if c in df.columns]
+    if len(env_cols) == 2:
+        tmp = df[env_cols].copy().apply(pd.to_numeric, errors='coerce')
+        for c in env_cols:
+            r = tmp[c].max() - tmp[c].min()
+            tmp[c] = (tmp[c] - tmp[c].min()) / r if r > 0 else 0
+        df['environmental_index'] = tmp.mean(axis=1)
+
+    if all(c in df.columns for c in ['farm_income_USD_PPP_pHH_Yr', 'LandCultivated']):
+        df['farm_income_per_land'] = df['farm_income_USD_PPP_pHH_Yr'] / (df['LandCultivated'] + EPS)
+    if all(c in df.columns for c in ['livestock_prodsales_USD_PPP_pHH_Yr', 'LivestockHoldings']):
+        df['livestock_productivity'] = df['livestock_prodsales_USD_PPP_pHH_Yr'] / (df['LivestockHoldings'] + EPS)
+    if all(c in df.columns for c in ['offfarm_income_USD_PPP_pHH_Yr', 'farm_income_USD_PPP_pHH_Yr']):
+        df['offfarm_to_farm_ratio'] = df['offfarm_income_USD_PPP_pHH_Yr'] / (df['farm_income_USD_PPP_pHH_Yr'] + EPS)
+    if all(c in df.columns for c in ['LandCultivated', 'LandOwned']):
+        df['land_utilization_rate'] = (df['LandCultivated'] / (df['LandOwned'] + EPS)).clip(0, 2)
+
+    return df
+
+
+# ==============================================================================
+# PREPROCESSING & PREDICTION
+# ==============================================================================
+
+def build_raw_frame(user_responses: dict) -> pd.DataFrame:
+    all_base = NUMERICAL_FEATURES + list(CATEGORICAL_FEATURES.keys())
+    data = {col: np.nan for col in all_base}
+    data.update(user_responses)
+    return pd.DataFrame([data])
+
+
+def _detect_numeric_pipeline_cols(preprocessor) -> set:
+    """Return the set of column names routed to a numeric (median-imputing) sub-pipeline."""
+    numeric_cols = set()
+    try:
+        for _name, transformer, cols in preprocessor.transformers_:
+            is_numeric_pipe = False
+            if hasattr(transformer, 'steps'):
+                for _sname, step in transformer.steps:
+                    if hasattr(step, 'strategy') and getattr(step, 'strategy', '') == 'median':
+                        is_numeric_pipe = True
+                        break
+            elif hasattr(transformer, 'strategy') and getattr(transformer, 'strategy', '') == 'median':
+                is_numeric_pipe = True
+            if is_numeric_pipe and isinstance(cols, (list, np.ndarray)):
+                numeric_cols.update(cols)
+    except Exception:
+        pass
+    return numeric_cols
+
+
+def prepare_sklearn_input(engineered_df: pd.DataFrame, preprocessor):
+    df = engineered_df.copy()
+
+    expected_cols = getattr(preprocessor, 'feature_names_in_', None)
+    if expected_cols is not None:
+        for col in expected_cols:
+            if col not in df.columns:
+                df[col] = np.nan
+        df = df[list(expected_cols)]
+
+    # If categorical columns appear in the numeric sub-pipeline it means the
+    # notebook ordinal-encoded them before fitting the preprocessor.
+    # Encode them to integer indices using the known category lists so the
+    # median imputer receives numeric data as it did during training.
+    numeric_pipe_cols = _detect_numeric_pipeline_cols(preprocessor)
+    for col, cats in CATEGORICAL_FEATURES.items():
+        if col in numeric_pipe_cols and col in df.columns:
+            df[col] = df[col].apply(
+                lambda v: float(cats.index(v)) if v in cats else np.nan
+            )
+
+    return preprocessor.transform(df)
+
+
+def prepare_catboost_input(engineered_df: pd.DataFrame, num_imputer, feature_meta: dict):
+    cb_cols   = feature_meta.get('feature_cols_cb', [])
+    num_feats = feature_meta.get('num_features', [])
+    cat_feats = feature_meta.get('cat_features', [])
+
+    for col in cb_cols:
+        if col not in engineered_df.columns:
+            engineered_df[col] = np.nan
+
+    num_present = [c for c in num_feats if c in engineered_df.columns]
+    if num_present:
+        num_arr = num_imputer.transform(engineered_df[num_present])
+        num_df  = pd.DataFrame(num_arr, columns=num_present)
+    else:
+        num_df = pd.DataFrame()
+
+    cat_present = [c for c in cat_feats if c in engineered_df.columns]
+    cat_df = engineered_df[cat_present].fillna('missing').astype(str).reset_index(drop=True)
+    num_df = num_df.reset_index(drop=True)
+
+    combined   = pd.concat([num_df, cat_df], axis=1)
+    final_cols = [c for c in cb_cols if c in combined.columns]
+    return combined[final_cols]
+
+
+def run_prediction(model_name, user_responses,
+                   models, preprocessor, num_imputer, label_encoder, feature_meta):
+    try:
+        model = models.get(model_name)
+        if model is None:
+            return None, None, f"Model '{model_name}' not loaded. Run notebook section 12 to export savedModels/."
+
+        requires_cb = MODEL_INFO[model_name]['requires_catboost_path']
+        raw_df      = build_raw_frame(user_responses)
+        engineered  = engineer_features(raw_df)
+
+        if requires_cb:
+            if num_imputer is None or feature_meta is None:
+                return None, None, "CatBoost preprocessing artifacts (num_imputer / feature_metadata) not loaded."
+            X = prepare_catboost_input(engineered, num_imputer, feature_meta)
+        else:
+            if preprocessor is None:
+                return None, None, "Sklearn preprocessor not loaded."
+            X = prepare_sklearn_input(engineered, preprocessor)
+
+        pred_encoded = model.predict(X)
+        if hasattr(pred_encoded, 'flatten'):
+            pred_encoded = pred_encoded.flatten()
+        pred_int   = int(pred_encoded[0])
+        probas_raw = model.predict_proba(X)[0]
+
+        pred_class  = label_encoder.inverse_transform([pred_int])[0]
+        probas_dict = {cls: float(p) for cls, p in zip(label_encoder.classes_, probas_raw)}
+
+        return pred_class, probas_dict, None
+
+    except Exception as e:
+        return None, None, f"{str(e)}\n\n{traceback.format_exc()}"
+
+
+# ==============================================================================
+# SHAP EXPLAINABILITY
+# ==============================================================================
+
+def compute_shap_local(model_name, user_responses,
+                       models, preprocessor, num_imputer, label_encoder, feature_meta):
+    try:
+        import shap as shap_lib
+    except ImportError:
+        return None, "shap package not installed. Run: pip install shap"
+
+    try:
+        model = models.get(model_name)
+        if model is None:
+            return None, "Model not loaded."
+
+        requires_cb = MODEL_INFO[model_name]['requires_catboost_path']
+        raw_df      = build_raw_frame(user_responses)
+        engineered  = engineer_features(raw_df)
+
+        if requires_cb:
+            X            = prepare_catboost_input(engineered, num_imputer, feature_meta)
+            explainer    = shap_lib.TreeExplainer(model)
+            shap_values  = explainer.shap_values(X)
+            feature_names = X.columns.tolist()
+        else:
+            X_proc        = prepare_sklearn_input(engineered, preprocessor)
+            explainer     = shap_lib.TreeExplainer(model)
+            shap_values   = explainer.shap_values(X_proc)
+            feature_names = (
+                preprocessor.get_feature_names_out().tolist()
+                if hasattr(preprocessor, 'get_feature_names_out')
+                else [f"f{i}" for i in range(X_proc.shape[1])]
+            )
+
+        sv = np.array(shap_values)
+        if sv.ndim == 3:
+            mean_abs = np.abs(sv[0]).mean(axis=-1)
+        elif sv.ndim == 2:
+            mean_abs = np.abs(sv[0])
+        else:
+            mean_abs = np.abs(sv).flatten()[:len(feature_names)]
+
+        shap_df = pd.DataFrame({
+            'feature':  feature_names[:len(mean_abs)],
+            'abs_shap': mean_abs[:len(feature_names)],
+        }).sort_values('abs_shap', ascending=False).reset_index(drop=True)
+
+        return shap_df, None
+
+    except Exception as e:
+        return None, f"SHAP computation failed: {str(e)}"
+
+
+# ==============================================================================
+# SESSION STATE
 # ==============================================================================
 
 def initialize_session_state():
-    """Initialize all session state variables."""
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "selected_model" not in st.session_state:
-        st.session_state.selected_model = None
-    if "model_selected" not in st.session_state:
-        st.session_state.model_selected = False
-    if "current_block_index" not in st.session_state:
-        st.session_state.current_block_index = 0
-    if "current_feature_index" not in st.session_state:
-        st.session_state.current_feature_index = 0
-    if "user_responses" not in st.session_state:
-        st.session_state.user_responses = {}
-    if "all_features_collected" not in st.session_state:
-        st.session_state.all_features_collected = False
-    if "prediction_made" not in st.session_state:
-        st.session_state.prediction_made = False
-    if "prev_question_timestamp" not in st.session_state:
-        st.session_state.prev_question_timestamp = datetime.datetime.fromtimestamp(0)
+    defaults = {
+        "messages":                [],
+        "selected_model":          "Stacking Ensemble",
+        "model_selected":          False,
+        "current_feature_index":   0,
+        "user_responses":          {},
+        "all_features_collected":  False,
+        "prediction_made":         False,
+        "prediction_result":       None,
+        "show_shap":               False,
+        "prev_question_timestamp": datetime.datetime.fromtimestamp(0),
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
 
+
+# ==============================================================================
+# FEATURE COLLECTION HELPERS
+# ==============================================================================
 
 def get_all_features_in_order():
-    """Get all features in a flat list maintaining block order."""
-    all_features = []
+    features = []
     for block in FEATURE_BLOCKS.values():
-        all_features.extend(block)
-    return all_features
+        features.extend(block)
+    return features
 
 
 def get_current_feature():
-    """Get the current feature to ask for."""
-    all_features = get_all_features_in_order()
-    if st.session_state.current_feature_index < len(all_features):
-        return all_features[st.session_state.current_feature_index]
-    return None
+    all_f = get_all_features_in_order()
+    idx   = st.session_state.current_feature_index
+    return all_f[idx] if idx < len(all_f) else None
 
 
-def get_feature_question(feature_name):
-    """Generate a user-friendly question for a feature."""
-    questions = {
-        'Country': "Let's start. Which country is your household located in?",
-        'HHsizeMAE': "How many household members are there? (Or estimate: 1 adult ≈ 1, 1 child ≈ 0.5)",
-        'LandOwned': "How much land does your household own? (Estimate in hectares. 1 hectare ≈ 2.5 acres)",
-        'LivestockHoldings': "What livestock do you own? (Rough total: 1 cow=1 TLU, 1 goat=0.2 TLU, 10 chickens=0.1 TLU)",
-        'NrofMonthsFoodInsecure': "How many months in the past year did your household struggle to have enough food? (0-12)",
-        'WorstFoodSecMonth': "During which month is food security typically worst?",
-        'Food_Self_Sufficiency_kCal_MAE_day': "Roughly how much food (in calories) can your household produce/access per day? (Typical: 1500-2500)",
-        'score_HDDS_GoodSeason': "During the good season, how many different food groups did your household consume? (0-12 groups)",
-        'farm_income_USD_PPP_pHH_Yr': "Roughly, what was your household's annual farm income? (Estimate in USD. If unsure: low=$100-500, medium=$500-2000, high=$2000+)",
-        'TVA_USD_PPP_pmae_pday': "Roughly, how much does your household earn per day from all activities? (If you earn ~$1-5/day, estimate accordingly)",
-        'PPI_Likelihood': "Based on your circumstances, do you think you could move out of poverty? (0-100%, where 0=unlikely, 100=very likely)",
-        'Gender_FemaleControl': "What proportion of household decisions are made by women? (0-1 scale: 0=none, 0.5=half, 1=all)"
-    }
-    return questions.get(feature_name, f"Please provide a value for {feature_name.replace('_', ' ')}:")
+def get_progress_info():
+    return st.session_state.current_feature_index, len(get_all_features_in_order())
 
 
 def validate_numerical_input(feature_name, value):
-    """Validate numerical input with constraints."""
     try:
-        num_value = float(value)
-        
-        # Define constraints for specific features
-        if feature_name == 'NrofMonthsFoodInsecure':
-            if not (0 <= num_value <= 12):
-                return None, "Please enter a value between 0 and 12 months"
-        elif feature_name == 'PPI_Likelihood':
-            if not (0 <= num_value <= 100):
-                return None, "Please enter a value between 0 and 100%"
-        elif feature_name == 'Gender_FemaleControl':
-            if not (0 <= num_value <= 1):
-                return None, "Please enter a value between 0 and 1 (e.g., 0.5 for 50%)"
-        elif feature_name in ['HHsizeMAE', 'LandOwned', 'LivestockHoldings']:
-            if num_value < 0:
-                return None, f"{feature_name} cannot be negative"
-        elif feature_name == 'score_HDDS_GoodSeason':
-            if not (0 <= num_value <= 12):
-                return None, "Dietary diversity score should be between 0 and 12"
-        elif feature_name in ['Food_Self_Sufficiency_kCal_MAE_day', 'TVA_USD_PPP_pmae_pday', 'farm_income_USD_PPP_pHH_Yr']:
-            if num_value < 0:
-                return None, f"{feature_name} cannot be negative"
-        
-        return num_value, None
-        
-    except ValueError:
-        return None, "Invalid input: Please enter a valid number"
+        v = float(value)
+    except (ValueError, TypeError):
+        return None, "Please enter a valid number."
+
+    bounded = {
+        'PPI_Likelihood': (0, 100),
+        'Gender_FemaleControl': (0, 1),
+        'Market_Orientation': (0, 1),
+        'score_HDDS_GoodSeason': (0, 12),
+        'score_HDDS_BadSeason': (0, 12),
+        'score_HDDS_farmbasedGoodSeason': (0, 12),
+        'score_HDDS_purchasedGoodSeason': (0, 12),
+        'score_HDDS_farmbasedBadSeason': (0, 12),
+        'score_HDDS_purchasedBadSeason': (0, 12),
+        'NrofMonthsWildFoodCons': (0, 12),
+    }
+    if feature_name in bounded:
+        lo, hi = bounded[feature_name]
+        if not (lo <= v <= hi):
+            return None, f"Value must be between {lo} and {hi}."
+    elif v < 0:
+        return None, "Value cannot be negative."
+    return v, None
 
 
 def validate_categorical_input(feature_name, value):
-    """Validate categorical input against known values."""
-    if feature_name not in CATEGORICAL_FEATURES:
-        return None, f"Unknown categorical feature: {feature_name}"
-    
-    valid_options = CATEGORICAL_FEATURES[feature_name]
-    if value not in valid_options:
-        options_str = ', '.join(valid_options[:5]) + ('...' if len(valid_options) > 5 else '')
-        return None, f"Invalid option. Please select from available options."
-    
+    opts = CATEGORICAL_FEATURES.get(feature_name, [])
+    if value not in opts:
+        return None, "Please select a valid option."
     return value, None
 
 
-def preprocess_user_input(user_responses, preprocessor):
-    """
-    Convert user responses to a DataFrame and apply preprocessing.
-    The preprocessor expects raw feature names (before transformation).
-    """
-    try:
-        if preprocessor is None:
-            st.error("❌ Preprocessor not available. Cannot make prediction.")
-            return None, "Preprocessor not loaded"
-        
-        # Define ALL features the training data had (in order)
-        # These are the original raw features before any transformation
-        all_raw_features = [
-            # Numerical features
-            'HHsizeMAE', 'LandOwned', 'LandCultivated', 'LivestockHoldings',
-            'NrofMonthsFoodInsecure', 'PPI_Threshold', 'PPI_Likelihood',
-            'score_HDDS_GoodSeason', 'score_HDDS_farmbasedGoodSeason',
-            'score_HDDS_purchasedGoodSeason', 'score_HDDS_BadSeason',
-            'score_HDDS_farmbasedBadSeason', 'score_HDDS_purchasedBadSeason',
-            'TVA_USD_PPP_pmae_pday', 'total_income_USD_PPP_pHH_Yr',
-            'offfarm_income_USD_PPP_pHH_Yr', 'farm_income_USD_PPP_pHH_Yr',
-            'value_crop_consumed_USD_PPP_pHH_Yr', 'livestock_prodsales_USD_PPP_pHH_Yr',
-            'value_livestock_production_USD_PPP_pHH_Yr', 'Food_Self_Sufficiency_kCal_MAE_day',
-            'NrofMonthsWildFoodCons', 'Gender_FemaleControl',
-            # Categorical features
-            'Country', 'HouseholdType', 'Head_EducationLevel', 
-            'WorstFoodSecMonth', 'BestFoodSecMonth',
-            'Livestock_Orientation', 'Market_Orientation'
-        ]
-        
-        # Create a dictionary with default values (NaN for missing features)
-        input_data = {feature: np.nan for feature in all_raw_features}
-        
-        # Update with user-provided responses
-        input_data.update(user_responses)
-        
-        # Create DataFrame with all features in the correct order
-        input_df = pd.DataFrame([input_data])
-        
-        # Ensure columns are in the same order as training
-        input_df = input_df[all_raw_features]
-        
-        st.write(f"ℹ️ Input shape: {input_df.shape}")
-        st.write(f"ℹ️ Provided features: {list(user_responses.keys())}")
-        st.write(f"ℹ️ Missing features (will be imputed): {len(all_raw_features) - len(user_responses)}")
-        
-        # Apply preprocessor.transform to the input
-        # The preprocessor will handle feature transformation and imputation
-        preprocessed_data = preprocessor.transform(input_df)
-        
-        st.write(f"ℹ️ Output shape after preprocessing: {preprocessed_data.shape}")
-        
-        return input_df, preprocessed_data
-        
-    except Exception as e:
-        error_msg = f"Error preprocessing data: {str(e)}"
-        st.error(f"❌ {error_msg}")
-        import traceback
-        st.error(traceback.format_exc())
-        return None, error_msg
+# ==============================================================================
+# UI COMPONENTS
+# ==============================================================================
 
-
-def make_prediction(model, preprocessed_data, label_encoder):
-    """
-    Make prediction using the selected model.
-    """
-    try:
-        if model is None:
-            return None, None, "❌ Model not available"
-        
-        # Make prediction
-        prediction = model.predict(preprocessed_data)[0]
-        
-        # Get prediction probability
-        try:
-            probabilities = model.predict_proba(preprocessed_data)[0]
-            confidence = max(probabilities) * 100
-        except (AttributeError, IndexError):
-            # Model doesn't have predict_proba (e.g., some SVM models)
-            confidence = 90.0
-        
-        # Decode prediction using label_encoder
-        if label_encoder is None:
-            pred_label = "Food Secure" if prediction == 1 else "Food Insecure"
-        else:
-            decoded_label = label_encoder.inverse_transform([prediction])[0]
-            # Ensure proper formatting of the label
-            if ("Secure" in str(decoded_label) or "Insecure" in str(decoded_label)) and "Food" not in str(decoded_label):
-                pred_label = f"Food {decoded_label}"
-            else:
-                pred_label = str(decoded_label)
-        
-        return pred_label, confidence, None
-        
-    except Exception as e:
-        return None, None, f"❌ Error making prediction: {str(e)}"
-
-
-def display_initial_screen():
-    """Display the initial model selection screen."""
-    # st.markdown("---")
-    
-    # Decorative element
+def display_initial_screen(models):
     st.markdown("## 🌾 Food Security Prediction Assistant")
-    st.markdown("Predict household food security status using machine learning")
-    
+    st.markdown("Predict household food security status using machine learning.")
     st.markdown("---")
     st.markdown("### 🤖 Select a Model")
-    st.markdown("Choose which model to use for making your prediction:")
-    
-    # Display model selection as pills
-    model_pills = []
-    for model_name, info in MODEL_INFO.items():
-        label = f"{info['icon']} {model_name}"
-        model_pills.append(label)
-    
+
+    available   = [n for n, m in models.items() if m is not None]
+    unavailable = [n for n, m in models.items() if m is None]
+
+    if unavailable:
+        st.info(
+            f"ℹ️ The following models are not yet available "
+            f"(run notebook section 12 to export to savedModels/): "
+            f"{', '.join(unavailable)}"
+        )
+
+    pill_options = [f"{MODEL_INFO[n]['icon']} {n}" for n in MODEL_INFO]
     selected_pill = st.pills(
         label="Available Models",
         label_visibility="collapsed",
-        options=model_pills,
+        options=pill_options,
     )
-    
+
     if selected_pill:
-        # Extract model name from pill text (remove icon)
-        for i, pill in enumerate(model_pills):
-            if pill == selected_pill:
-                model_name = list(MODEL_INFO.keys())[i]
-                st.session_state.selected_model = model_name
-                st.session_state.model_selected = True
-                
-                # Add to chat history
-                st.session_state.messages.append({
-                    "role": "user",
-                    "content": f"I want to use {model_name}"
-                })
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": f"Great choice! I'll use **{model_name}** ({MODEL_INFO[model_name]['description']}). Let's start collecting your household information. I'll ask you questions one by one. Ready?"
-                })
-                
-                st.rerun()
-    
+        model_name = None
+        for name in MODEL_INFO:
+            if name in selected_pill:
+                model_name = name
+                break
+        if model_name is None:
+            model_name = list(MODEL_INFO.keys())[0]
+
+        if models.get(model_name) is None:
+            st.error(f"❌ {model_name} is not loaded yet. Please choose an available model.")
+        else:
+            info = MODEL_INFO[model_name]
+            st.session_state.selected_model  = model_name
+            st.session_state.model_selected  = True
+            st.session_state.messages.append({"role": "user",      "content": f"I want to use {model_name}"})
+            st.session_state.messages.append({"role": "assistant", "content": (
+                f"Great choice! I'll use **{model_name}** — {info['description']}.\n\n"
+                f"**Weighted Kappa:** {info['weighted_kappa']:.4f} &nbsp;|&nbsp; "
+                f"**ROC-AUC:** {info['roc_auc']:.4f}\n\n"
+                f"I'll ask you about your household across 8 topic areas. "
+                f"Questions marked **(Optional)** can be skipped — those fields will be "
+                f"estimated from patterns in the training data. Ready?"
+            )})
+            st.rerun()
+
     st.markdown("---")
-    
-    # Legal disclaimer button
     col1, col2, col3 = st.columns([1, 1, 1])
     with col3:
         if st.button("📋 Legal Disclaimer", key="disclaimer_btn"):
@@ -454,132 +725,102 @@ def display_initial_screen():
 
 @st.dialog("Legal Disclaimer")
 def show_disclaimer_dialog():
-    """Display legal disclaimer in a modal dialog."""
     st.markdown("""
-    ### ⚠️ Important Information
-    
-    **Data Collection:**
-    - We collect only the most important features for accurate predictions
-    - Any missing features are automatically estimated based on statistical patterns
-    - This approach maintains prediction accuracy while reducing data burden
-    
-    **Data Privacy & Security:**
-    - Your household information will be used solely for prediction
-    - Do not enter sensitive personal data (names, precise locations, etc.)
-    - Data is processed locally and not stored after prediction
-    
-    **Model Limitations:**
-    - Predictions are based on statistical models and may not be 100% accurate
-    - Results should be interpreted in context of local conditions
-    - This tool provides estimates only, not definitive assessments
-    - Food security is influenced by many factors beyond the data collected here
-    
-    **Disclaimer:**
-    - Predictions may be inaccurate, inefficient, or biased
-    - Users should exercise reasonable judgment and human oversight
-    - We are not liable for any actions or decisions based on these predictions
-    - Use this tool responsibly and ethically
-    
-    **By proceeding, you agree to:**
-    - Provide accurate information to the best of your knowledge
-    - Use predictions only for informational purposes
-    - Not rely solely on this tool for critical decisions
-    
-    For more information, visit: [RHoMIS Documentation](https://www.rhomis.org)
+### ⚠️ Important Information
+
+**Data Collection:**
+- We collect household survey features aligned with the RHoMIS indicator set
+- Optional features are imputed from statistical patterns in training data
+- Leakage variables (e.g. *NrofMonthsFoodInsecure*) are intentionally excluded
+
+**Data Privacy & Security:**
+- Household information is used solely for this prediction session
+- Do not enter precise GPS coordinates or personally identifiable information
+- Data is processed locally and not stored after the session ends
+
+**Model Limitations:**
+- Predictions are probabilistic estimates based on ~13,000 RHoMIS households (2015–2018)
+- Primary metric is Quadratic Weighted Kappa (ordinal accuracy), not binary classification
+- MildlyFI (~18% recall) is the hardest class to distinguish from adjacent categories
+- Performance varies by country — validate locally before operational use
+
+**Disclaimer:**
+- Predictions may be inaccurate or biased, especially outside the training distribution
+- Not intended as the sole basis for resource allocation or policy decisions
+
+For more information: [RHoMIS Documentation](https://www.rhomis.org)
     """)
-    
     if st.button("I Understand & Accept", key="accept_disclaimer"):
         st.toast("Disclaimer accepted!", icon="✅")
 
 
 def display_chat_history():
-    """Display all messages from chat history."""
-    for i, message in enumerate(st.session_state.messages):
+    for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            if message["role"] == "assistant":
-                st.container()  # Fix ghost message bug
-            
+            st.container()
             st.markdown(message["content"])
 
 
-def display_feature_input(feature_name):
-    """Display input widget for a specific feature."""
-    question = get_feature_question(feature_name)
-    description = FEATURE_DESCRIPTIONS.get(feature_name, "")
-    
-    st.markdown(f"**{question}**")
-    if description:
-        st.caption(f"{description}")
-    
-    # Determine input type and create widget
-    if feature_name in CATEGORICAL_FEATURES:
-        options = CATEGORICAL_FEATURES[feature_name]
-        user_input = st.selectbox(
-            label="Select option:",
-            options=options,
-            label_visibility="collapsed",
-            key=f"input_{feature_name}"
+def display_result_panel(pred_class: str, probas_dict: dict, model_name: str):
+    meta  = CLASS_META[pred_class]
+    info  = MODEL_INFO[model_name]
+    conf  = probas_dict.get(pred_class, 0) * 100
+    color = meta['color']
+
+    st.markdown(f"""
+---
+### {meta['emoji']} Assessment Complete
+
+<div style="background:{color}22; border-left:5px solid {color}; padding:14px 18px; border-radius:6px; margin-bottom:12px;">
+<h3 style="margin:0; color:{color};">{meta['emoji']} {meta['label']}</h3>
+<p style="margin:4px 0 0 0; color:#444;">{meta['desc']}</p>
+</div>
+""", unsafe_allow_html=True)
+
+    st.markdown(
+        f"**Confidence:** {conf:.1f}% &nbsp;|&nbsp; "
+        f"**Model:** {model_name} &nbsp;|&nbsp; "
+        f"**W-Kappa:** {info['weighted_kappa']:.4f} &nbsp;|&nbsp; "
+        f"**ROC-AUC:** {info['roc_auc']:.4f}"
+    )
+
+    st.markdown("#### Class Probabilities")
+    for cls in HFIAS_ORDER:
+        p     = probas_dict.get(cls, 0)
+        cmeta = CLASS_META[cls]
+        st.markdown(
+            f"**{cmeta['label']}** &nbsp; {p*100:.1f}%  "
+            f"<div style='background:#eee; border-radius:4px; height:12px; margin-bottom:6px;'>"
+            f"<div style='background:{cmeta['color']}; width:{p*100:.1f}%; height:12px; border-radius:4px;'></div>"
+            f"</div>",
+            unsafe_allow_html=True
         )
-        return user_input, True
-    else:
-        user_input = st.number_input(
-            label="Enter value:",
-            value=0.0,
-            step=0.1,
-            label_visibility="collapsed",
-            key=f"input_{feature_name}"
-        )
-        return user_input, False
 
+    st.markdown("---")
+    st.markdown("""
+### 📝 Interpretation
 
-def get_progress_info():
-    """Get current progress information."""
-    all_features = get_all_features_in_order()
-    current_index = st.session_state.current_feature_index
-    total_features = len(all_features)
-    return current_index, total_features
+This uses a **4-class ordinal model** evaluated with **Quadratic Weighted Kappa**, which penalises
+misclassifications proportionally to their ordinal distance.
 
+**Key drivers (SHAP analysis of top features):**
+- `score_HDDS_BadSeason` — lean-season dietary diversity is the single most predictive feature
+- `hdds_seasonal_gap` — large good→lean diet drop signals seasonal vulnerability
+- `Food_Self_Sufficiency_kCal_MAE_day` — threshold effect below subsistence level
+- `PPI_Likelihood`, income features — important but secondary to nutrition indicators
 
-def display_prediction_result(pred_label, confidence, model_name):
-    """Display prediction result in chat format."""
-    accuracy = MODEL_INFO[model_name]["accuracy"]
-    
-    # Determine status emoji
-    status_emoji = "✅" if pred_label == "Food Secure" else "⚠️"
-    status_color = "green" if pred_label == "Food Secure" else "orange"
-    
-    result_text = f"""
-    ### Assessment Complete!
-    
-    **Predicted Status:** {status_emoji} **{pred_label}**
-    
-    **Confidence:** {confidence:.1f}%
-    
-    **Model Used:** {model_name}
-    
-    **Model Accuracy:** {accuracy*100:.0f}%
-    
-    ---
-    
-    ### 📝 Interpretation
-    
-    This prediction is based on the household characteristics you provided. 
-    Food security is influenced by many factors, and this assessment should be 
-    considered as one input among many when making decisions.
-    
-    ### ✨ Next Steps
-    
-    - **Understand Your Results:** Review the prediction in context of your local situation
-    - **Take Action:** Based on the results, consider appropriate interventions
-    - **Get Support:** Reach out to local agricultural extension services if needed
-    
-    ---
-    
-    **Disclaimer:** This prediction is for informational purposes only and should 
-    not be the sole basis for critical decisions.
-    """
-    
-    return result_text
+### ✨ Recommended Actions
+
+| Class | Action |
+|---|---|
+| **Food Secure** | Maintain resilience; focus on lean-season buffers |
+| **Mildly FI** | Dietary diversification; off-farm income support |
+| **Moderately FI** | Food access programmes; livelihood diversification |
+| **Severely FI** | Immediate food assistance; safety-net enrolment |
+
+---
+*This prediction is for informational purposes only and should not be the sole basis for critical decisions.*
+""")
 
 
 # ==============================================================================
@@ -587,204 +828,237 @@ def display_prediction_result(pred_label, confidence, model_name):
 # ==============================================================================
 
 def main():
-    """Main application flow."""
-    
-    # Initialize session state
     initialize_session_state()
-    
-    # Load models
-    models, preprocessor, label_encoder = load_models()
-    
-    # Display header
-    # st.html("<h1 style='text-align: center; margin-bottom: 0;'>🌾 Food Security Prediction Assistant</h1>")
-    # st.markdown("<p style='text-align: center; color: gray;'>Using ML to predict household food security</p>", 
-    #             unsafe_allow_html=True)
-    
-    # Check if model is selected
+    models, preprocessor, num_imputer, label_encoder, feature_meta = load_artifacts()
+
     if not st.session_state.model_selected:
-        display_initial_screen()
+        display_initial_screen(models)
         st.stop()
-    
-    # Display header with model name and restart button
+
+    # Header
     col1, col2 = st.columns([0.85, 0.15])
     with col1:
-        st.markdown(f"### 🤖 Model: {st.session_state.selected_model}")
+        info = MODEL_INFO[st.session_state.selected_model]
+        st.markdown(
+            f"### {info['icon']} {st.session_state.selected_model} "
+            f"<span style='font-size:0.75em; color:gray;'>"
+            f"W-Kappa {info['weighted_kappa']:.4f} · ROC-AUC {info['roc_auc']:.4f}"
+            f"</span>",
+            unsafe_allow_html=True,
+        )
     with col2:
         if st.button("↻ Restart", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.selected_model = None
-            st.session_state.model_selected = False
-            st.session_state.current_feature_index = 0
-            st.session_state.user_responses = {}
-            st.session_state.all_features_collected = False
-            st.session_state.prediction_made = False
+            for k in ["messages", "user_responses", "current_feature_index",
+                      "model_selected", "all_features_collected",
+                      "prediction_made", "prediction_result", "show_shap"]:
+                if k == "messages":
+                    st.session_state[k] = []
+                elif k == "user_responses":
+                    st.session_state[k] = {}
+                elif k == "current_feature_index":
+                    st.session_state[k] = 0
+                elif k in ["prediction_result"]:
+                    st.session_state[k] = None
+                else:
+                    st.session_state[k] = False
+            st.session_state.selected_model = "Stacking Ensemble"
             st.rerun()
-    
+
     st.markdown("---")
-    
-    # Display chat history
     display_chat_history()
-    
-    # Handle feature collection
+
+    # Feature collection
     if not st.session_state.all_features_collected:
-        # Get current feature
         current_feature = get_current_feature()
-        
+
         if current_feature is None:
             st.session_state.all_features_collected = True
             st.rerun()
-        
-        # Display question and get input
-        question = get_feature_question(current_feature)
+
+        question    = FEATURE_QUESTIONS.get(current_feature, f"Enter {current_feature.replace('_', ' ')}:")
         description = FEATURE_DESCRIPTIONS.get(current_feature, "")
-        
+        is_optional = current_feature in OPTIONAL_FEATURES
+
+        current_idx, total = get_progress_info()
+        st.progress(current_idx / total, text=f"Question {current_idx + 1} of {total}")
+
+        block_label = next(
+            (bl for bl, feats in FEATURE_BLOCKS.items() if current_feature in feats), ""
+        )
+        if block_label:
+            st.caption(f"Section: **{block_label}**")
+
         st.markdown(f"### {question}")
         if description:
-            st.caption(f"{description}")
-        
-        # Create input widget based on feature type
+            st.caption(description)
+
         if current_feature in CATEGORICAL_FEATURES:
-            # Use selectbox for categorical features
-            options = CATEGORICAL_FEATURES[current_feature]
             user_input = st.selectbox(
-                label=f"Select {current_feature.replace('_', ' ')}:",
-                options=options,
+                label="Select option:",
+                options=CATEGORICAL_FEATURES[current_feature],
                 label_visibility="collapsed",
-                key=f"input_{current_feature}"
+                key=f"input_{current_feature}",
             )
-            input_received = True
         else:
-            # Use number input for numerical features
             user_input = st.number_input(
-                label=f"Enter {current_feature.replace('_', ' ')}:",
+                label="Enter value:",
                 value=0.0,
                 step=0.1,
                 label_visibility="collapsed",
-                key=f"input_{current_feature}"
+                key=f"input_{current_feature}",
             )
-            input_received = True
-        
-        # Create columns for Submit button
-        col1, col2, col3 = st.columns([1, 1, 1])
-        with col2:
-            submit_button = st.button("✓ Submit", use_container_width=True, key=f"submit_{current_feature}")
-        
-        if submit_button:
-            # Rate limiting
-            question_timestamp = datetime.datetime.now()
-            time_diff = question_timestamp - st.session_state.prev_question_timestamp
-            st.session_state.prev_question_timestamp = question_timestamp
-            
-            if time_diff < MIN_TIME_BETWEEN_REQUESTS:
-                time.sleep((MIN_TIME_BETWEEN_REQUESTS - time_diff).total_seconds())
-            
-            # Validate input
+
+        col_a, col_b, col_c = st.columns([1, 1, 1])
+        with col_b:
+            submit_btn = st.button("✓ Submit", use_container_width=True, key=f"submit_{current_feature}")
+        with col_c:
+            skip_btn = st.button("⏭ Skip", use_container_width=True, key=f"skip_{current_feature}") if is_optional else False
+
+        if skip_btn:
+            st.session_state.messages.append({
+                "role": "user",
+                "content": f"*{question}*\n**Skipped** (will be estimated from data)"
+            })
+            st.session_state.current_feature_index += 1
+            next_feat = get_current_feature()
+            ack = f"↩️ Skipped — I'll estimate that. ({current_idx + 1}/{total})"
+            if next_feat is None:
+                st.session_state.all_features_collected = True
+                ack += "\n\n🎉 All done! Running the prediction pipeline..."
+            else:
+                ack += "\n\nReady for the next question!"
+            st.session_state.messages.append({"role": "assistant", "content": ack})
+            st.rerun()
+
+        if submit_btn:
+            now  = datetime.datetime.now()
+            diff = now - st.session_state.prev_question_timestamp
+            st.session_state.prev_question_timestamp = now
+            if diff < MIN_TIME_BETWEEN_REQUESTS:
+                time.sleep((MIN_TIME_BETWEEN_REQUESTS - diff).total_seconds())
+
             if current_feature in CATEGORICAL_FEATURES:
-                validated_input, error_msg = validate_categorical_input(current_feature, user_input)
+                validated, err = validate_categorical_input(current_feature, user_input)
             else:
-                validated_input, error_msg = validate_numerical_input(current_feature, user_input)
-            
-            if error_msg:
-                st.error(f"❌ {error_msg}")
+                validated, err = validate_numerical_input(current_feature, user_input)
+
+            if err:
+                st.error(f"❌ {err}")
             else:
-                # Add to chat history
-                st.session_state.messages.append({"role": "user", "content": f"{question}\n**Answer:** {user_input}"})
-                
-                # Store response
-                st.session_state.user_responses[current_feature] = validated_input
-                
-                # Get progress
-                current_idx, total = get_progress_info()
-                progress_text = f"({current_idx + 1}/{total})"
-                
-                # Generate assistant response
-                acknowledgment = f"✅ Got it! {progress_text}"
-                
-                # Move to next feature
+                st.session_state.messages.append({
+                    "role": "user",
+                    "content": f"*{question}*\n**Answer:** {user_input}"
+                })
+                st.session_state.user_responses[current_feature] = validated
                 st.session_state.current_feature_index += 1
-                next_feature = get_current_feature()
-                
-                if next_feature is None:
-                    response_text = f"{acknowledgment}\n\n🎉 Great! I've collected all the information. Let me make the prediction..."
+                next_feat = get_current_feature()
+
+                ack = f"✅ Got it! ({current_idx + 1}/{total})"
+                if next_feat is None:
                     st.session_state.all_features_collected = True
+                    ack += "\n\n🎉 All information collected. Running the prediction pipeline..."
                 else:
-                    response_text = f"{acknowledgment}\n\nReady for the next question!"
-                
-                st.session_state.messages.append({"role": "assistant", "content": response_text})
+                    ack += "\n\nReady for the next question!"
+
+                st.session_state.messages.append({"role": "assistant", "content": ack})
                 st.rerun()
-    
+
+    # Prediction
     elif not st.session_state.prediction_made:
-        # Make prediction
         with st.chat_message("assistant"):
-            with st.spinner("🔄 Processing your data and making prediction..."):
-                # Preprocess data
-                input_df, preprocessed_data = preprocess_user_input(
+            with st.spinner("🔄 Engineering features and running prediction..."):
+                pred_class, probas_dict, err = run_prediction(
+                    st.session_state.selected_model,
                     st.session_state.user_responses,
-                    preprocessor
+                    models, preprocessor, num_imputer, label_encoder, feature_meta,
                 )
-                
-                if input_df is None:
-                    error_msg = f"❌ {preprocessed_data}"
-                    st.markdown(error_msg)
-                    st.session_state.messages.append({"role": "assistant", "content": error_msg})
-                    st.session_state.prediction_made = True
-                else:
-                    # Make prediction
-                    model = models.get(st.session_state.selected_model)
-                    if model is None:
-                        error_msg = f"❌ Model '{st.session_state.selected_model}' is not available"
-                        st.markdown(error_msg)
-                        st.session_state.messages.append({"role": "assistant", "content": error_msg})
-                    else:
-                        pred_label, confidence, pred_error = make_prediction(
-                            model,
-                            preprocessed_data,
-                            label_encoder
-                        )
-                        
-                        if pred_error:
-                            error_msg = f"❌ {pred_error}"
-                            st.markdown(error_msg)
-                            st.session_state.messages.append({"role": "assistant", "content": error_msg})
-                        else:
-                            # Display results
-                            result_text = display_prediction_result(
-                                pred_label,
-                                confidence,
-                                st.session_state.selected_model
-                            )
-                            st.markdown(result_text)
-                            st.session_state.messages.append({
-                                "role": "assistant",
-                                "content": result_text
-                            })
-                    
-                    st.session_state.prediction_made = True
-        
+
+            if err:
+                msg = f"❌ Prediction failed:\n```\n{err}\n```"
+                st.markdown(msg)
+                st.session_state.messages.append({"role": "assistant", "content": msg})
+            else:
+                st.session_state.prediction_result = (pred_class, probas_dict)
+                display_result_panel(pred_class, probas_dict, st.session_state.selected_model)
+                cmeta = CLASS_META[pred_class]
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": (
+                        f"**Prediction:** {cmeta['emoji']} {cmeta['label']} "
+                        f"({probas_dict.get(pred_class, 0)*100:.1f}% confidence)\n\n"
+                        f"See the panel above for full class probabilities, model metrics, "
+                        f"and interpretation. Use the **Explain** button below for SHAP feature contributions."
+                    )
+                })
+
+        st.session_state.prediction_made = True
         st.rerun()
-    
+
+    # Post-prediction
     else:
-        # Show follow-up options
+        if st.session_state.prediction_result:
+            pred_class, probas_dict = st.session_state.prediction_result
+            display_result_panel(pred_class, probas_dict, st.session_state.selected_model)
+
+        st.markdown("---")
+
+        # SHAP toggle
+        shap_label = "🔍 Hide SHAP explanation" if st.session_state.show_shap else "🔍 Explain this prediction (SHAP)"
+        if st.button(shap_label, key="shap_btn"):
+            st.session_state.show_shap = not st.session_state.show_shap
+            st.rerun()
+
+        if st.session_state.show_shap:
+            with st.spinner("Computing SHAP values..."):
+                shap_df, shap_err = compute_shap_local(
+                    st.session_state.selected_model,
+                    st.session_state.user_responses,
+                    models, preprocessor, num_imputer, label_encoder, feature_meta,
+                )
+            if shap_err:
+                st.warning(f"⚠️ SHAP unavailable: {shap_err}")
+            else:
+                st.markdown("#### 🔍 Top Feature Contributions (mean |SHAP| across all classes)")
+                top_n     = min(15, len(shap_df))
+                max_val   = shap_df['abs_shap'].max()
+                for _, row in shap_df.head(top_n).iterrows():
+                    bar_pct = (row['abs_shap'] / max_val * 100) if max_val > 0 else 0
+                    st.markdown(
+                        f"**{row['feature']}** &nbsp; `{row['abs_shap']:.4f}`  "
+                        f"<div style='background:#e3f2fd; border-radius:4px; height:10px; margin-bottom:5px;'>"
+                        f"<div style='background:#1565c0; width:{bar_pct:.1f}%; height:10px; border-radius:4px;'></div>"
+                        f"</div>",
+                        unsafe_allow_html=True
+                    )
+                st.caption(
+                    "Each bar shows the average absolute SHAP contribution of that feature "
+                    "to the model's output across all four food-security classes. "
+                    "Longer bar = more influential for this household's prediction."
+                )
+
+        # Follow-up
+        st.markdown("---")
         user_input = st.chat_input(
-            placeholder="Ask a follow-up question...",
+            placeholder="Ask a follow-up question about your result...",
             key="followup_input"
         )
-        
         if user_input:
             with st.chat_message("user"):
-                st.text(user_input)
-            
+                st.markdown(user_input)
             with st.chat_message("assistant"):
-                response = "Thank you for your question! For more detailed analysis or support, please reach out to your local agricultural extension services."
+                response = (
+                    "For on-the-ground guidance, please contact your local agricultural extension service. "
+                    "For methodology questions, refer to the [RHoMIS documentation](https://www.rhomis.org) "
+                    "and the study notebook."
+                )
                 st.markdown(response)
-                st.session_state.messages.append({"role": "user", "content": user_input})
-                st.session_state.messages.append({"role": "assistant", "content": response})
-            
+            st.session_state.messages.append({"role": "user",      "content": user_input})
+            st.session_state.messages.append({"role": "assistant", "content": response})
             st.rerun()
 
 
 # ==============================================================================
-# APP ENTRY POINT
+# ENTRY POINT
 # ==============================================================================
 
 if __name__ == "__main__":
